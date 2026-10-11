@@ -1,0 +1,24 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local knowledge, models, dependencies, results and recoverable legacy archive
+/data/
+docs/
+/evals/
+/runtime/
+/tmp/
+/.local/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
