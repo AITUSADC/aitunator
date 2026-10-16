@@ -22,7 +22,7 @@ services:
     ports:
       - "${APP_PORT:-8000}:8000"
     environment:
-      RAG_MODE: ${RAG_MODE:-auto}
+      RAG_MODE: ${RAG_MODE:-mock}
       SQLITE_PATH: /app/runtime/aitunator.db
       SESSION_RETENTION_DAYS: ${SESSION_RETENTION_DAYS:-30}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
