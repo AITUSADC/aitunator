@@ -370,6 +370,14 @@ def resolve_program_mention(text: str | None) -> dict:
     return mentions[0] if len(mentions) == 1 else {}
 
 
+def list_programs() -> list[dict[str, str]]:
+    """Stable API catalog; field names match the frontend contract."""
+    items = {meta["program_code"]: {key: str(meta.get(key) or "") for key in
+             ("program_code", "program_slug", "program_name", "school")}
+             for meta in PROGRAM_MARKDOWN_REGISTRY.values()}
+    return [items[code] for code in sorted(items)]
+
+
 def resolve_program_mentions(text: str | None) -> list[dict]:
     """Recognize punctuation/code boundaries and avoid aliases inside longer names."""
     if not text:

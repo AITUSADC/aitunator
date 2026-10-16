@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.rag.example
 
 # Local knowledge, models, dependencies, results and recoverable legacy archive
 /data/

@@ -1,4 +1,4 @@
-"""Retrieval pipeline only; history, generation and relevance retry remain future work."""
+"""Synchronous retrieval plus lazy async entry points for the API contract."""
 from collections import defaultdict
 from time import perf_counter
 from backend.app.rag.retriever import retrieve_candidates, rank_candidates
@@ -29,3 +29,26 @@ def search(query, *, corpus, encode, fanout=True, candidates=8,
     results = balanced_results(groups)
     stages["total_ms"] = (perf_counter() - start) * 1000
     return results, dict(stages), queries
+
+
+async def startup():
+    from backend.app.rag.runtime import startup as initialize
+    await initialize()
+
+
+async def shutdown():
+    from backend.app.rag.runtime import shutdown as close
+    await close()
+
+
+def is_ready():
+    from backend.app.rag.runtime import is_ready as ready
+    return ready()
+
+
+async def answer(question, history, program_code=None):
+    from contextlib import aclosing
+    from backend.app.rag.runtime import answer as generate
+    async with aclosing(generate(question, history, program_code)) as events:
+        async for event in events:
+            yield event
