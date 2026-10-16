@@ -100,6 +100,7 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let terminalReceived = false;
 
   const processBlock = (block: string) => {
     const trimmed = block.trim();
@@ -127,12 +128,14 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
     } else if (eventName === "token" && typeof parsed.text === "string") {
       options.onToken(parsed.text);
     } else if (eventName === "done") {
+      terminalReceived = true;
       options.onDone({
         session_id: String(parsed.session_id || ""),
         message_id: parsed.message_id ? String(parsed.message_id) : null,
         finish_reason: String(parsed.finish_reason || "stop"),
       });
     } else if (eventName === "error") {
+      terminalReceived = true;
       options.onError({
         code: String(parsed.code || "stream_error"),
         message: String(parsed.message || "Ошибка при генерации ответа."),
@@ -153,5 +156,14 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
   }
   if (buffer.trim()) {
     processBlock(buffer);
+  }
+
+  // Handle stream closing without terminal done/error event (Point 4)
+  if (!terminalReceived && !options.signal.aborted) {
+    options.onError({
+      code: "unterminated_stream",
+      message: "Поток ответа прервался до завершения генерации.",
+      retryable: true,
+    });
   }
 }

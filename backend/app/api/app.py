@@ -1,12 +1,4 @@
-"""FastAPI application implementing the AITUNATOR v1 API and SSE contract.
-
-Endpoints:
-- POST /api/chat          (SSE streaming chat with session history, timeouts, PII filter, and cancellation)
-- GET  /api/sessions/{id} (restore session history)
-- POST /api/feedback      (rate an assistant response with optional comment and PII check)
-- GET  /api/programs      (list educational programs)
-- GET  /api/health        (check SQLite, Qdrant reachability, and KB/model configuration)
-"""
+"""FastAPI application implementing the AITUNATOR v1 API and SSE contract."""
 from __future__ import annotations
 
 import asyncio
@@ -125,7 +117,6 @@ def _format_sse(event: str, data: dict[str, Any]) -> str:
 
 
 def _probe_qdrant_sync(qdrant_url: str, collection_name: str, timeout: float = 1.5) -> dict[str, Any]:
-    """Check Qdrant availability without blocking the event loop."""
     base = qdrant_url.rstrip("/")
     info: dict[str, Any] = {
         "available": False,
@@ -160,7 +151,6 @@ def create_app(
     total_timeout: float | None = None,
     frontend_dist: str | Path | None = None,
 ) -> FastAPI:
-    """Create and configure the FastAPI application instance."""
     resolved_db = Database(db_path=db_path)
     resolved_limiter = SlidingWindowRateLimiter(
         max_requests=(
@@ -176,28 +166,49 @@ def create_app(
     async def lifespan(app: FastAPI):
         cleaned = await app.state.db.init()
         logger.info("SQLite initialized (expired sessions cleaned: %d)", cleaned)
-        # Call optional RAG lifespan startup hook if implemented by the first participant (TZ Section 3)
-        try:
-            import importlib
-            pipe_mod = importlib.import_module("backend.app.rag.pipeline")
-            startup_fn = getattr(pipe_mod, "startup", None) or getattr(pipe_mod, "init_rag", None)
-            if callable(startup_fn):
-                res = startup_fn()
-                if asyncio.iscoroutine(res):
-                    await res
-        except Exception:
-            logger.exception("Optional RAG startup hook failed")
+
+        # Track RAG readiness state per Point 2 of review
+        mode = os.getenv("RAG_MODE", "mock").strip().lower()
+        if mode not in ("mock", "real"):
+            app.state.rag_ready = False
+            app.state.rag_error = f"Неизвестное значение RAG_MODE='{mode}'. Ожидается 'mock' или 'real'."
+        elif mode == "mock":
+            app.state.rag_ready = True
+            app.state.rag_error = None
+        else:
+            # Mode is 'real': execute optional startup hook and verify answer() is present
+            try:
+                import importlib
+                pipe_mod = importlib.import_module("backend.app.rag.pipeline")
+                startup_fn = getattr(pipe_mod, "startup", None) or getattr(pipe_mod, "init_rag", None)
+                if callable(startup_fn):
+                    res = startup_fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+                real_answer = getattr(pipe_mod, "answer", None)
+                if not callable(real_answer):
+                    raise RuntimeError("Функция 'answer' не найдена в backend.app.rag.pipeline")
+                app.state.rag_ready = True
+                app.state.rag_error = None
+            except Exception as exc:
+                logger.exception("Failed to initialize real RAG in lifespan")
+                app.state.rag_ready = False
+                app.state.rag_error = f"Ошибка инициализации RAG-пайплайна: {exc}"
+
         yield
-        try:
-            import importlib
-            pipe_mod = importlib.import_module("backend.app.rag.pipeline")
-            shutdown_fn = getattr(pipe_mod, "shutdown", None)
-            if callable(shutdown_fn):
-                res = shutdown_fn()
-                if asyncio.iscoroutine(res):
-                    await res
-        except Exception:
-            pass
+
+        # Lifespan shutdown
+        if os.getenv("RAG_MODE", "mock").strip().lower() == "real":
+            try:
+                import importlib
+                pipe_mod = importlib.import_module("backend.app.rag.pipeline")
+                shutdown_fn = getattr(pipe_mod, "shutdown", None)
+                if callable(shutdown_fn):
+                    res = shutdown_fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception:
+                pass
 
     app = FastAPI(
         title="AITUNATOR API",
@@ -218,6 +229,8 @@ def create_app(
     app.state.rate_limiter = resolved_limiter
     app.state.session_locks = resolved_locks
     app.state.answer_fn = answer_fn
+    app.state.rag_ready = True
+    app.state.rag_error = None
     app.state.ttft_timeout = (
         ttft_timeout
         if ttft_timeout is not None
@@ -243,6 +256,30 @@ def create_app(
 
     @app.post("/api/chat")
     async def chat_endpoint(payload: ChatRequest, request: Request):
+        mode = os.getenv("RAG_MODE", "mock").strip().lower()
+
+        # Reject unknown RAG_MODE explicitly per Point 1
+        if mode not in ("mock", "real"):
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "code": "config_error",
+                    "message": f"Неизвестное значение RAG_MODE='{mode}'. Допустимы только 'mock' или 'real'.",
+                    "retryable": False,
+                },
+            )
+
+        # Check RAG readiness state per Point 2
+        if not getattr(app.state, "rag_ready", True) and mode == "real":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "rag_not_ready",
+                    "message": app.state.rag_error or "Реальный RAG-пайплайн не готов к обработке запросов.",
+                    "retryable": False,
+                },
+            )
+
         try:
             question, req_session_id, program_code = _normalize_chat_request(payload)
         except ValueError as exc:
@@ -278,6 +315,16 @@ def create_app(
         try:
             history = await app.state.db.get_recent_history(session_id, limit=HISTORY_WINDOW)
             rag_runner: AnswerFn = app.state.answer_fn or get_answer_fn()
+        except RuntimeError as exc:
+            app.state.session_locks.release(session_id)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "rag_not_ready",
+                    "message": str(exc),
+                    "retryable": False,
+                },
+            )
         except Exception:
             app.state.session_locks.release(session_id)
             raise
@@ -307,6 +354,7 @@ def create_app(
             producer_task = asyncio.create_task(_produce())
             started_at = time.monotonic()
             first_token_seen = False
+            terminal_event_seen = False
             answer_chunks: list[str] = []
             ttft_limit: float = app.state.ttft_timeout
             total_limit: float = app.state.total_timeout
@@ -330,11 +378,12 @@ def create_app(
                             await producer_task
                         except asyncio.CancelledError:
                             pass
+                        terminal_event_seen = True
                         yield _format_sse(
                             "error",
                             {
                                 "code": "timeout",
-                                "message": "Превышено максимальное время генерации ответа.",
+                                "message": "Превышено максимальное время генерации ответа (60 секунд).",
                                 "retryable": True,
                             },
                         )
@@ -348,11 +397,12 @@ def create_app(
                                 await producer_task
                             except asyncio.CancelledError:
                                 pass
+                            terminal_event_seen = True
                             yield _format_sse(
                                 "error",
                                 {
                                     "code": "timeout",
-                                    "message": "Превышено время ожидания первого токена ответа.",
+                                    "message": "Превышено время ожидания первого токена ответа (15 секунд).",
                                     "retryable": True,
                                 },
                             )
@@ -367,6 +417,16 @@ def create_app(
                         continue
 
                     if item is None:
+                        # Producer finished. Check if a terminal event (done or error) was sent per Point 4!
+                        if not terminal_event_seen:
+                            yield _format_sse(
+                                "error",
+                                {
+                                    "code": "incomplete_stream",
+                                    "message": "Поток генерации неожиданно завершился без подтверждения завершения.",
+                                    "retryable": True,
+                                },
+                            )
                         break
 
                     ev_type = item.get("type")
@@ -382,6 +442,7 @@ def create_app(
                             yield _format_sse("token", {"text": text})
 
                     elif ev_type == "error":
+                        terminal_event_seen = True
                         yield _format_sse(
                             "error",
                             {
@@ -395,10 +456,12 @@ def create_app(
                         break
 
                     elif ev_type == "done":
+                        terminal_event_seen = True
                         finish_reason = str(item.get("finish_reason") or "stop")
                         diagnostics = item.get("diagnostics") or {}
                         full_answer = "".join(answer_chunks)
 
+                        # Check PII with strict official contacts rule (Point 3)
                         skip_save = (
                             finish_reason == "guardrail"
                             or contains_pii(question)
@@ -525,29 +588,37 @@ def create_app(
         qdrant_info = await asyncio.to_thread(
             _probe_qdrant_sync, QDRANT_URL, COLLECTION_NAME, 1.5
         )
-        rag_mode = os.getenv("RAG_MODE", "auto").strip().lower()
-        kb_version = os.getenv("KB_VERSION", PARSER_VERSION)
-        status = "ok" if db_ok else "degraded"
+        rag_mode = os.getenv("RAG_MODE", "mock").strip().lower()
+        rag_ready = bool(getattr(app.state, "rag_ready", True))
+        rag_error = getattr(app.state, "rag_error", None)
+
+        status = "ok" if (db_ok and (rag_mode != "real" or rag_ready)) else "degraded"
+
         embedder_name = os.getenv("EMBEDDER") or os.getenv("EMBEDDING_MODEL", EMBEDDING_MODEL)
         llm_provider = os.getenv("LLM_PROVIDER", "groq")
         llm_model = os.getenv("LLM_MODEL") or os.getenv("LLM_MAIN_MODEL", "llama-3.3-70b-versatile")
         reranker_name = os.getenv("RERANKER") or os.getenv("RERANK_PROVIDER", "noop")
+
         return {
             "status": status,
             "sqlite": {
                 "available": db_ok,
                 "journal_mode": journal_mode,
             },
+            "rag": {
+                "mode": rag_mode,
+                "ready": rag_ready,
+                "error": rag_error,
+            },
             "qdrant": qdrant_info,
             "version": {
-                "kb_version": kb_version,
+                "kb_version": os.getenv("KB_VERSION", PARSER_VERSION),
                 "parser_version": PARSER_VERSION,
                 "programs_reviewed_at": PROGRAM_SITE_REVIEWED_AT,
                 "embedding_model": embedder_name,
                 "llm_provider": llm_provider,
                 "llm_model": llm_model,
                 "reranker": reranker_name,
-                "rag_mode": rag_mode,
             },
         }
 

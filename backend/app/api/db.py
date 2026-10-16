@@ -1,7 +1,7 @@
 """SQLite storage layer for sessions, messages, and feedback using aiosqlite in WAL mode.
 
-Includes an automatic stdlib sqlite3 async fallback when aiosqlite is not installed
-in minimal test environments, exposing the exact same async interface.
+Includes an explicit shared write lock to serialize write transactions across concurrent streams,
+preventing 'database is locked' errors while reads run lock-free in WAL mode.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from backend.app.api.rag_bridge import HistoryMessage
 
 try:
     import aiosqlite  # type: ignore
-except ImportError:  # pragma: no cover - fallback for environments without aiosqlite package
+except ImportError:
     aiosqlite = None
 
 
@@ -105,7 +105,7 @@ class _StdlibAsyncConnection:
 
     async def __aenter__(self) -> _StdlibAsyncConnection:
         self._conn = await asyncio.to_thread(
-            sqlite3.connect, self._db_path, timeout=5.0, isolation_level=None, check_same_thread=False
+            sqlite3.connect, self._db_path, timeout=10.0, isolation_level=None, check_same_thread=False
         )
         self._conn.row_factory = sqlite3.Row
         return self
@@ -143,7 +143,7 @@ class _AiosqliteConnectionWrapper:
         self._conn: Any = None
 
     async def __aenter__(self) -> Any:
-        self._conn = await aiosqlite.connect(self._db_path, timeout=5.0, isolation_level=None)
+        self._conn = await aiosqlite.connect(self._db_path, timeout=10.0, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         return self._conn
 
@@ -160,31 +160,31 @@ def _connect(db_path: str | Path):
 
 
 class Database:
-    """Async SQLite repository for chat sessions, messages, and answer feedback."""
+    """Async SQLite repository with WAL mode and shared write serialization."""
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db_path = Path(db_path or os.getenv("SQLITE_PATH", DEFAULT_DB_PATH))
+        self._write_lock = asyncio.Lock()
 
     async def init(self, retention_days: int = SESSION_RETENTION_DAYS) -> int:
-        """Enable WAL, create tables, and delete sessions inactive for > retention_days."""
+        """Enable WAL, create schema, and delete expired sessions."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with _connect(self.db_path) as conn:
+        async with self._write_lock, _connect(self.db_path) as conn:
             await conn.execute("PRAGMA journal_mode=WAL;")
             await conn.execute("PRAGMA synchronous=NORMAL;")
             await conn.execute("PRAGMA foreign_keys=ON;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
+            await conn.execute("PRAGMA busy_timeout=10000;")
             await conn.executescript(SCHEMA_SQL)
             await conn.execute("PRAGMA foreign_keys=ON;")
         return await self.cleanup_expired_sessions(days=retention_days)
 
     async def _prepare(self, conn: Any) -> None:
         await conn.execute("PRAGMA foreign_keys=ON;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
+        await conn.execute("PRAGMA busy_timeout=10000;")
 
     async def cleanup_expired_sessions(self, days: int = SESSION_RETENTION_DAYS) -> int:
-        """Delete sessions with last_active_at older than `days` days."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        async with _connect(self.db_path) as conn:
+        async with self._write_lock, _connect(self.db_path) as conn:
             await self._prepare(conn)
             await conn.execute("BEGIN IMMEDIATE;")
             try:
@@ -202,7 +202,7 @@ class Database:
     async def get_recent_history(
         self, session_id: str, limit: int = HISTORY_WINDOW
     ) -> list[HistoryMessage]:
-        """Return the last `limit` messages ({role, content}) in chronological order."""
+        """Read-only: runs concurrently in WAL mode without acquiring write lock."""
         async with _connect(self.db_path) as conn:
             await self._prepare(conn)
             cur = await conn.execute(
@@ -232,20 +232,18 @@ class Database:
         finish_reason: str = "stop",
         diagnostics: dict | None = None,
     ) -> str:
-        """Atomically persist the session, user question, and assistant answer in one transaction.
-
-        Returns the generated assistant `message_id`.
-        """
+        """Atomically persist session, user question, and assistant answer under write lock."""
         now_user = _utc_now_iso()
         now_assistant = _utc_now_iso()
         user_msg_id = str(uuid.uuid4())
         assistant_msg_id = str(uuid.uuid4())
+
         diagnostics_dict = diagnostics if isinstance(diagnostics, dict) else {}
         sources_list = diagnostics_dict.get("sources") if isinstance(diagnostics_dict.get("sources"), list) else []
         sources_json = json.dumps(sources_list, ensure_ascii=False)
         diagnostics_json = json.dumps(diagnostics_dict, ensure_ascii=False) if diagnostics_dict else None
 
-        async with _connect(self.db_path) as conn:
+        async with self._write_lock, _connect(self.db_path) as conn:
             await self._prepare(conn)
             await conn.execute("BEGIN IMMEDIATE;")
             try:
@@ -287,7 +285,7 @@ class Database:
                 raise
 
     async def get_session_history(self, session_id: str) -> dict[str, Any] | None:
-        """Fetch session metadata and full message history for GET /api/sessions/{id}."""
+        """Read-only: runs concurrently in WAL mode without acquiring write lock."""
         async with _connect(self.db_path) as conn:
             await self._prepare(conn)
             cur = await conn.execute(
@@ -350,9 +348,9 @@ class Database:
         rating: int,
         comment: str | None = None,
     ) -> dict[str, Any]:
-        """Save or update user feedback for an assistant message."""
+        """Save feedback under shared write lock."""
         now = _utc_now_iso()
-        async with _connect(self.db_path) as conn:
+        async with self._write_lock, _connect(self.db_path) as conn:
             await self._prepare(conn)
             await conn.execute("BEGIN IMMEDIATE;")
             try:
@@ -396,7 +394,6 @@ class Database:
                 raise
 
     async def check_health(self) -> tuple[bool, str]:
-        """Verify SQLite WAL mode and read/write availability."""
         try:
             async with _connect(self.db_path) as conn:
                 cur = await conn.execute("PRAGMA journal_mode;")

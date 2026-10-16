@@ -1,7 +1,10 @@
-"""Contract types, program catalog adapter, and mock/real RAG wiring for the API layer.
+"""Contract types, program catalog adapter, and strict mock/real RAG wiring.
 
-Keeps all Second Participant integration logic inside backend/app/api/ so that
-backend/app/rag/ is not modified on this branch, preventing git merge conflicts.
+Per Point 1 of review:
+- Only RAG_MODE=mock|real is accepted (default: 'mock').
+- Unknown RAG_MODE values raise a configuration RuntimeError.
+- When RAG_MODE='real', strictly requires backend.app.rag.pipeline.answer and raises
+  RuntimeError if unavailable (never silently falls back to mock).
 """
 from __future__ import annotations
 
@@ -63,11 +66,7 @@ _THIRD_PARTY_PII_RE = re.compile(
 
 
 def list_programs() -> list[dict[str, str]]:
-    """Return a stable, sorted list of educational programs for GET /api/programs.
-
-    Delegates to backend.app.rag.programs.list_programs() if the first participant
-    has added it; otherwise builds the exact same list from PROGRAM_MARKDOWN_REGISTRY.
-    """
+    """Return a stable, sorted list of educational programs for GET /api/programs."""
     programs_mod = importlib.import_module("backend.app.rag.programs")
     custom_fn = getattr(programs_mod, "list_programs", None)
     if callable(custom_fn):
@@ -88,7 +87,6 @@ def list_programs() -> list[dict[str, str]]:
 
 
 def is_valid_program_code(program_code: str | None) -> bool:
-    """Return True if program_code is None or matches a known AITU program code/slug."""
     if program_code is None:
         return True
     resolved = resolve_program_filter(program_code)
@@ -96,7 +94,6 @@ def is_valid_program_code(program_code: str | None) -> bool:
 
 
 def normalize_program_code(program_code: str | None) -> str | None:
-    """Normalize a program code or slug to canonical program_code (e.g. '6B06102')."""
     if not program_code:
         return None
     resolved = resolve_program_filter(program_code)
@@ -108,20 +105,21 @@ async def mock_answer(
     history: list[HistoryMessage],
     program_code: str | None = None,
 ) -> AsyncIterator[RagEvent]:
-    """Contract-compliant mock RAG generator for development and testing before real RAG is wired."""
+    """Contract-compliant mock RAG generator for development and testing."""
     delay_ms = float(os.getenv("MOCK_RAG_STEP_MS", "15")) / 1000.0
 
     yield {"type": "status", "stage": "planning"}
     if delay_ms > 0:
         await asyncio.sleep(delay_ms)
 
-    # Guardrail check (admission guarantees, personal data, private contacts)
+    # Guardrails: admission guarantees, personal data, private contacts
     if contains_pii(question) or _GUARANTEE_RE.search(question) or _THIRD_PARTY_PII_RE.search(question):
         yield {"type": "status", "stage": "generating"}
         guardrail_text = (
             "Я не обрабатываю персональные данные, личные контакты сотрудников/студентов "
             "и не даю индивидуальных гарантий поступления или присуждения гранта. "
-            "По индивидуальным вопросам приёма обратитесь в приёмную комиссию Astana IT University."
+            "По официальным вопросам приёма обратитесь в приёмную комиссию Astana IT University: "
+            "admission@astanait.edu.kz или +7 (7172) 645-710."
         )
         for chunk in _chunk_text(guardrail_text):
             if delay_ms > 0:
@@ -165,7 +163,7 @@ async def mock_answer(
         f"- **Ваш вопрос:** {question.strip()}\n"
         f"- **Срок обучения на бакалавриате:** 3 года (триместровая система).\n"
         f"- **Язык обучения:** английский.\n"
-        f"- **Формат:** демонстрационный потоковый режим (мок RAG по согласованному контракту `docs/contract.md`)."
+        f"- **Официальные контакты:** admission@astanait.edu.kz, +7 (7172) 645-710."
     )
 
     yield {"type": "status", "stage": "generating"}
@@ -181,7 +179,7 @@ async def mock_answer(
             "mode": "mock",
             "program_code": canonical_code,
             "history_used": len(history),
-            "sources": [program_info.get("source") or "admissions.md"],
+            "sources": [program_info.get("source") or "SE_DP_.pdf"],
         },
     }
 
@@ -197,23 +195,26 @@ def _chunk_text(text: str, words_per_chunk: int = 4) -> list[str]:
 
 
 def get_answer_fn() -> AnswerFn:
-    """Resolve the RAG answer generator according to RAG_MODE ('mock', 'real', or 'auto')."""
-    mode = os.getenv("RAG_MODE", "auto").strip().lower()
+    """Resolve the RAG answer generator strictly according to RAG_MODE ('mock' or 'real')."""
+    mode = os.getenv("RAG_MODE", "mock").strip().lower()
     if mode == "mock":
         return mock_answer
 
+    if mode != "real":
+        raise RuntimeError(f"Неизвестное значение RAG_MODE='{mode}'. Ожидается 'mock' или 'real'.")
+
+    last_error: Exception | None = None
     for module_name in ("backend.app.rag.pipeline", "backend.app.rag"):
         try:
             mod = importlib.import_module(module_name)
             real_fn = getattr(mod, "answer", None)
             if callable(real_fn):
                 return real_fn
-        except ImportError:
-            continue
+        except Exception as exc:
+            last_error = exc
 
-    if mode == "real":
-        raise RuntimeError(
-            "RAG_MODE='real' is set, but 'async def answer(question, history, program_code=None)' "
-            "was not found in backend.app.rag.pipeline"
-        )
-    return mock_answer
+    detail = f" ({last_error})" if last_error else ""
+    raise RuntimeError(
+        "RAG_MODE='real' установлен, но функция 'async def answer(question, history, program_code=None)' "
+        f"не найдена в backend.app.rag.pipeline{detail}"
+    )
