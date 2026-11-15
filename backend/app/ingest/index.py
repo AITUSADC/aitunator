@@ -19,6 +19,7 @@ from backend.app.config import (
 from backend.app.ingest.extract import build_chunks, build_markdown_chunks, parse_with_docling
 from backend.app.rag.vector_store import create_qdrant_client
 from backend.app.providers.embeddings.sentence_transformer import encode_documents
+from backend.app.providers.embeddings.openai import load_api_embedder
 
 load_dotenv()
 
@@ -96,8 +97,9 @@ def _encode_chunks_to_cache(
     cache_file = Path(cache_path)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     with cache_file.open("a", encoding="utf-8") as cache_f:
-        for i in tqdm(range(0, len(items_to_encode), BATCH_SIZE), desc=description):
-            batch = items_to_encode[i : i + BATCH_SIZE]
+        step = getattr(model, "batch_size", BATCH_SIZE)  # API embedders take larger requests
+        for i in tqdm(range(0, len(items_to_encode), step), desc=description):
+            batch = items_to_encode[i : i + step]
             texts = [item[0] for item in batch]
             vectors = encode_documents(
                 model,
@@ -247,7 +249,7 @@ def main():
         parser.error("PDF indexing requires `uv sync --extra pdf`.")
 
     device = get_device()
-    embed_model = SentenceTransformer(EMBEDDING_MODEL, device=device)
+    embed_model = load_api_embedder(EMBEDDING_MODEL) or SentenceTransformer(EMBEDDING_MODEL, device=device)
     client = create_qdrant_client()
     create_collection(client)
     manifest = _load_manifest(MANIFEST_FILE)

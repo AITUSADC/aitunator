@@ -35,6 +35,7 @@ def load_retriever():
     import torch
     from sentence_transformers import SentenceTransformer
     from backend.app.rag.corpus import OfflineCorpus
+    from backend.app.providers.embeddings.openai import load_api_embedder
     from backend.app.providers.embeddings.sentence_transformer import encode_documents
     from backend.app.ingest.extract import _embedding_prefix
 
@@ -45,7 +46,8 @@ def load_retriever():
     name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
     cache = Path(os.getenv("MODEL_CACHE_DIR", "tmp/models"))
     download = os.getenv("RAG_ALLOW_MODEL_DOWNLOAD", "0") == "1"
-    if not Path(name).is_dir() and not download:
+    model = load_api_embedder(name)
+    if model is None and not Path(name).is_dir() and not download:
         repository = cache / ("models--" + name.replace("/", "--"))
         ref = repository / "refs/main"
         if not ref.is_file():
@@ -59,7 +61,8 @@ def load_retriever():
     if threads < 1 or not 5 <= candidates <= 100:
         raise ValueError("Invalid retrieval thread/candidate limits")
     torch.set_num_threads(threads)
-    model = SentenceTransformer(name, device="cpu", cache_folder=str(cache), local_files_only=not download)
+    if model is None:
+        model = SentenceTransformer(name, device="cpu", cache_folder=str(cache), local_files_only=not download)
     indices = sorted({0, len(corpus.rows) // 2, len(corpus.rows) - 1})
     texts = [f"{_embedding_prefix(corpus.rows[i]['payload'])} {corpus.rows[i]['payload']['text']}" for i in indices]
     vectors = encode_documents(model, texts, show_progress_bar=False)

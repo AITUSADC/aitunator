@@ -98,6 +98,17 @@ def requested_sections(query: str) -> frozenset[str]:
     return frozenset(topics)
 
 
+_CATALOG_QUERY = re.compile(
+    r"\b(?:как(?:ие|ая|ой)|список|перечень|сколько|все|what|which|list)\s+(?:\w+\s+){0,2}"
+    r"(?:программ\w*|специальност\w*|направлени\w*|факультет\w*|школ\w*|programs?|majors?)"
+    r"|\bна\s+кого\s+(?:можно\s+)?(?:учиться|поступить|выучиться)", re.I)
+
+
+def wants_catalog(query: str) -> bool:
+    """"What programmes are there": the general catalogue loses to noisy chunks in plain retrieval."""
+    return bool(_CATALOG_QUERY.search(query))
+
+
 def prefer_sections(candidates, query: str) -> tuple:
     """Stable soft selection within retrieved candidates, never a corpus-wide filter.
 

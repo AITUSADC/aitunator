@@ -8,6 +8,7 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 MAX_CHARS_PER_CHUNK = 1000
 CHUNK_OVERLAP = 200
+TABLE_CHUNK_CHARS = 3000
 BATCH_SIZE = 16
 CACHE_FILE = "runtime/points_cache.jsonl"
 MANIFEST_FILE = "runtime/indexed_files.json"

@@ -57,11 +57,17 @@ class AnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("source", prompt_data["evidence"][0])
 
     async def test_guards_do_not_call_model_or_retrieval(self):
-        for question in ["Мой ИИН 040512500123", "Гарантируешь поступление?", "Личный телефон декана", "My email a@example.com"]:
+        for question in ["Мой ИИН 040512500123", "Личный телефон декана", "My email a@example.com"]:
             events = await self.collect(self.service(), question)
             self.assertEqual(events[-1]["finish_reason"], "guardrail")
             self.assertEqual(self.provider.calls, [])
             self.assertEqual(self.retrievals, [])
+
+    async def test_admission_chance_questions_are_answered_not_refused(self):
+        for question in ["Точно ли нужен IELTS для поступления?", "Гарантируешь поступление?"]:
+            events = await self.collect(self.service([SUFFICIENT]), question)
+            self.assertEqual(events[-1]["finish_reason"], "stop")
+            self.assertIn("не обещай", self.provider.calls[-1][0]["content"].lower())
 
     async def test_history_rewrite_filters_pii_and_caps_window(self):
         history = [{"role": "user", "content": f"Вопрос {i}"} for i in range(12)]
@@ -82,24 +88,39 @@ class AnswerTests(unittest.IsolatedAsyncioTestCase):
         data = json.loads(self.provider.calls[-1][-1]["content"])
         self.assertEqual(data["standalone_question"], "Срок обучения?")
 
-    async def test_two_insufficient_results_refuse_without_generation(self):
-        replies = [{"sufficient": False, "evidence_ids": [], "retry_query": q} for q in ("Другой запрос", "Третий запрос")]
-        events = await self.collect(self.service(replies))
+    async def test_insufficient_facts_lead_to_consultation_with_partial_facts(self):
+        replies = [{"sufficient": False, "evidence_ids": ["0"], "retry_query": q} for q in ("Другой запрос", "Третий запрос")]
+        events = await self.collect(self.service(replies, tokens=("Уточните программу?",)))
         self.assertEqual(len(self.retrievals), 2)
         self.assertEqual(events[-1]["finish_reason"], "no_data")
-        self.assertFalse(self.provider.stream_closed)
+        self.assertEqual("".join(e["text"] for e in events if e["type"] == "token"), "Уточните программу?")
+        self.assertTrue(self.provider.stream_closed)
+        system, data = self.provider.calls[-1][0]["content"], json.loads(self.provider.calls[-1][-1]["content"])
+        self.assertIn("уточняющ", system)
+        self.assertEqual([item["text"] for item in data["partial_evidence"]], ["Обучение длится три года."])
+        self.assertIn("Software Engineering", [p["name"] for p in data["programs"]])
 
-    async def test_empty_corpus_refuses_without_llm(self):
-        events = await self.collect(self.service(rows=()))
+    async def test_empty_corpus_still_consults(self):
+        events = await self.collect(self.service(rows=()), "Привет!")
         self.assertEqual(events[-1]["finish_reason"], "no_data")
-        self.assertEqual(self.provider.calls, [])
+        self.assertTrue(self.provider.stream_closed)
+        self.assertEqual(json.loads(self.provider.calls[-1][-1]["content"])["partial_evidence"], [])
 
-    async def test_invalid_judge_and_unrecognized_ids_never_generate(self):
-        for reply in ({"sufficient": "true", "evidence_ids": ["0"]},
-                      {"sufficient": True, "evidence_ids": ["999"]}):
-            events = await self.collect(self.service([reply]))
-            self.assertNotEqual(events[-1].get("finish_reason"), "stop")
-            self.assertFalse(self.provider.stream_closed)
+    async def test_answer_and_consultation_receive_clean_history(self):
+        history = [{"role": "user", "content": "Хочу поступить"}, {"role": "assistant", "content": "На какую программу?"},
+                   {"role": "user", "content": "a@example.com"}]
+        await self.collect(self.service([{"query": "Срок обучения Software Engineering?"}, SUFFICIENT]),
+                           "Software Engineering", history)
+        sent = json.loads(self.provider.calls[-1][-1]["content"])["history"]
+        self.assertEqual([row["content"] for row in sent], ["Хочу поступить", "На какую программу?"])
+
+    async def test_invalid_judge_is_error_and_unrecognized_ids_are_not_grounded(self):
+        events = await self.collect(self.service([{"sufficient": "true", "evidence_ids": ["0"]}]))
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertFalse(self.provider.stream_closed)
+        events = await self.collect(self.service([{"sufficient": True, "evidence_ids": ["999"]}]))
+        self.assertEqual(events[-1]["finish_reason"], "no_data")
+        self.assertEqual(json.loads(self.provider.calls[-1][-1]["content"])["partial_evidence"], [])
 
     async def test_provider_failure_after_token_is_error_not_done(self):
         events = await self.collect(self.service([SUFFICIENT], tokens=("Часть", ProviderError("llm_incomplete"))))

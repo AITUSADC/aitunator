@@ -98,6 +98,40 @@ python -m venv .venv
 Дополнительные группы зависимостей: `qdrant` для индексации и `pdf` для
 опционального PDF-парсера. Полный список — в [`pyproject.toml`](pyproject.toml).
 
+## Локальный запуск
+
+Нужны Python 3.12+, Node.js 18+ и ключи `OPENAI_API_KEY` (эмбеддинги) и `GROQ_API_KEY` (LLM).
+База знаний и готовый индекс лежат в [aitu-kb](https://github.com/AITUSADC/aitu-kb).
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e ".[models,rag]"
+
+# база знаний и индекс
+git clone https://github.com/AITUSADC/aitu-kb.git ../aitu-kb
+mkdir -p data runtime
+cp -r ../aitu-kb/md data/md
+gunzip -c ../aitu-kb/index/points_cache.jsonl.gz > runtime/points_cache.jsonl
+
+# настройки: в .env задайте RAG_MODE=real, EMBEDDER и EMBEDDING_MODEL=openai/text-embedding-3-large,
+# OPENAI_API_KEY и GROQ_API_KEY
+cp .env.example .env
+
+# backend на :8000; модули не читают .env сами
+set -a; source .env; set +a
+.venv/bin/uvicorn backend.app.api.app:app --port 8000
+
+# frontend на :5173 (в другом терминале), /api проксируется на :8000
+cd frontend && npm install && npm run dev
+```
+
+Без ключей можно запустить с `RAG_MODE=mock`, тогда ответы будут заглушками.
+Индекс в aitu-kb построен `openai/text-embedding-3-large`. С локальной BGE-M3 (`EMBEDDING_MODEL=BAAI/bge-m3`)
+его нужно пересобрать (см. «Индексация»), иначе runtime откажется стартовать из-за несовпадения векторов.
+
+Пересборка базы с сайта и Google Drive: `pip install -e ".[crawl,qdrant]"`, `apt install tesseract-ocr tesseract-ocr-rus`,
+затем `python -m backend.app.ingest.crawl`. Подробности в [`backend/app/ingest/README.md`](backend/app/ingest/README.md).
+
 ## Данные и оценка поиска
 
 Для экспериментов нужны локальные файлы:
@@ -108,8 +142,9 @@ python -m venv .venv
 | `runtime/points_cache.jsonl` | Чанки, метаданные и векторы документов |
 | `tmp/models/` | Кеш моделей |
 
-Документы, векторы и модели **не входят в Git**. После клонирования необходимо
-получить совместимый снимок базы или подготовить собственный. Набор вопросов
+Документы, векторы и модели **не входят в Git**. Снимок базы и индекса берётся из
+[aitu-kb](https://github.com/AITUSADC/aitu-kb) (см. «Локальный запуск»). Для этого индекса eval
+запускается с `--embedding-model openai/text-embedding-3-large`. Набор вопросов
 [`eval/golden.jsonl`](eval/golden.jsonl) включён в репозиторий; его разметка
 соответствует корпусу, использованному в экспериментах.
 
@@ -210,9 +245,15 @@ python -m backend.app.rag.cli "Какие предметы изучают на S
 
 История — последние 10 завершённых сообщений `{role, content}`, без текущего
 вопроса. При наличии истории быстрая модель формирует самостоятельный запрос.
-После поиска она проверяет достаточность фактов: при нехватке допускается
-один повтор поиска, затем отказ. Основная модель получает только выбранные
-фрагменты и выдаёт поток текста; нейросетевого reranker нет.
+После поиска она проверяет, отвечают ли фрагменты хотя бы на основную часть вопроса.
+Если нет, допускается один повтор поиска. Если фактов так и не нашлось, бот не отказывает
+шаблоном, а консультирует (`finish_reason: no_data`): говорит, чего не знает, задаёт
+уточняющие вопросы, предлагает программы из реестра и контакт приёмной комиссии.
+Шаблонный отказ остаётся только для ПДн и чужих контактов. Основная модель получает
+выбранные фрагменты и историю и выдаёт поток текста; нейросетевого reranker нет.
+На вопросы «какие программы есть» первым идёт каталог `programs/index.md`.
+Для reasoning-моделей (например, `gpt-6-luna`) задайте пустой `LLM_TEMPERATURE` и
+`TTFT_TIMEOUT_SECONDS` около 40: до первого токена идут до четырёх вызовов модели.
 
 События: `status {stage}`, `token {text}`, `done {finish_reason, diagnostics}`,
 `error {code, message, retryable}`, каждое также содержит `type`.
