@@ -1,7 +1,7 @@
 import logging
 import re
 
-from backend.app.config import CHUNK_OVERLAP, MAX_CHARS_PER_CHUNK
+from backend.app.config import CHUNK_OVERLAP, MAX_CHARS_PER_CHUNK, TABLE_CHUNK_CHARS
 from backend.app.rag.programs import get_markdown_metadata, get_program_metadata
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,13 @@ _SECTION_TYPES = {
     "краткое описание": "overview",
     "основная информация": "overview",
     "цель программы": "overview",
+    "цель образовательной программы": "overview",
+    "о специальности": "overview",
     "overview": "overview",
+    "результаты обучения": "skills",
+    "структура программы": "curriculum",
+    "учебные дисциплины": "curriculum",
+    "перечень должностей": "career",
     "для кого": "fit",
     "чему научишься": "skills",
     "навыки": "skills",
@@ -125,6 +131,26 @@ def extract_sections_markdown(text: str) -> dict:
 def _is_markdown_table(text: str) -> bool:
     """Return True if text contains a proper Markdown table (has header-separator row)."""
     return "|" in text and bool(_TABLE_SEP.search(text))
+
+
+def _split_table_section(content: str, limit: int = TABLE_CHUNK_CHARS) -> list[str]:
+    """Split by lines into pieces <= limit; a piece that starts inside a table repeats its header."""
+    lines = content.splitlines()
+    pieces, current, header = [], [], []
+    for i, line in enumerate(lines):
+        is_row = line.startswith("|")
+        if is_row and i + 1 < len(lines) and _TABLE_SEP.fullmatch(lines[i + 1].strip()):
+            header = [line, lines[i + 1]]
+        elif not is_row and line.strip():
+            header = []
+        size = sum(len(item) + 1 for item in current)
+        if current and size + len(line) > limit and line not in header:
+            pieces.append("\n".join(current).strip())
+            current = list(header) if is_row else []
+        current.append(line)
+    if current:
+        pieces.append("\n".join(current).strip())
+    return [piece for piece in pieces if piece]
 
 
 def _is_noisy_table(text: str) -> bool:
@@ -286,18 +312,19 @@ def build_chunks(
             if _is_noisy_table(content):
                 logger.debug("Skipping noisy table in section '%s'", section_name)
                 continue
-            payload = _base_payload(
-                source_name=source_name,
-                section_name=section_name,
-                source_format=source_format,
-                source_group=source_group,
-                doc_type=doc_type,
-                metadata=metadata,
-                chunk_index=len(chunks),
-                content_type="table",
-            )
-            payload["text"] = content
-            chunks.append((f"{_embedding_prefix(payload)} {content}", payload))
+            for piece in _split_table_section(content):
+                payload = _base_payload(
+                    source_name=source_name,
+                    section_name=section_name,
+                    source_format=source_format,
+                    source_group=source_group,
+                    doc_type=doc_type,
+                    metadata=metadata,
+                    chunk_index=len(chunks),
+                    content_type="table",
+                )
+                payload["text"] = piece
+                chunks.append((f"{_embedding_prefix(payload)} {piece}", payload))
         else:
             chunks.extend(
                 _chunk_text_by_sentences(

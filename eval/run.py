@@ -21,6 +21,7 @@ import numpy as np
 from backend.app.rag.corpus import OfflineCorpus
 
 from backend.app.rag.retriever import retrieve_candidates, rank_candidates, retrieval_features
+from backend.app.providers.embeddings.openai import load_api_embedder
 from backend.app.providers.embeddings.sentence_transformer import encode_query, encode_documents
 from backend.app.rag.retrieval_common import _payload_matches_scope, _tokenize, _ru_stops, _en_stops
 
@@ -138,7 +139,7 @@ def run(args):
             torch.set_num_threads(args.threads)
             from sentence_transformers import SentenceTransformer
             tick = perf_counter()
-            encoder = SentenceTransformer(model_location(args.embedding_model, args.model_cache, args.download_models), device=args.device,
+            encoder = load_api_embedder(args.embedding_model) or SentenceTransformer(model_location(args.embedding_model, args.model_cache, args.download_models), device=args.device,
                 cache_folder=str(args.model_cache), local_files_only=not args.download_models)
             loading_ms["encoder"] = (perf_counter() - tick) * 1000
             print(f"Encoder loaded in {loading_ms['encoder'] / 1000:.1f}s", flush=True)
