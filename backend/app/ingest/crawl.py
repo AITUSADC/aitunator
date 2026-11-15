@@ -16,6 +16,7 @@ import httpx
 from markdownify import markdownify
 
 from backend.app.config import KNOWLEDGE_BASE_DIR
+from backend.app.rag.programs import PROGRAM_MARKDOWN_REGISTRY
 from backend.app.ingest.documents import RAW_DOCS_DIR, cached_markdown, document_links, fetch_documents, drop_signature_pages, strip_personal_tables
 
 OCR_WORKERS = min(8, os.cpu_count() or 1)  # ponytail: fixed for ~1 GB RAM per worker on large scans
@@ -147,6 +148,27 @@ def build_document(title: str, pages: list[tuple[str, list[str]]], chrome: set[s
     return f"---\ntitle: {title}\nsource_url: [{urls}]\nlanguage: ru\nupdated_at: {updated_at}\n---\n\n{text}\n"
 
 
+def _overview(md: str, sentences: int = 2) -> str:
+    match = re.search(r"^## О специальности\n(.*?)(?=^## |\Z)", md, re.M | re.S)
+    text = " ".join(match.group(1).split()) if match else ""
+    return " ".join(re.split(r"(?<=[.!?])\s+", text)[:sentences])
+
+
+def build_program_catalog(documents: dict[str, str], updated_at: str) -> str:
+    """programs/index.md: one list of all programmes by school (answers "what programmes are there")."""
+    programs = [(PROGRAM_MARKDOWN_REGISTRY[name], md) for name, md in documents.items()
+                if name in PROGRAM_MARKDOWN_REGISTRY]
+    schools: dict[str, list[str]] = {}
+    for meta, _ in programs:
+        schools.setdefault(meta["school"], []).append(f"{meta['program_name']} ({meta['program_code']})")
+    listing = "\n".join(f"- {school}: {', '.join(names)}." for school, names in sorted(schools.items()))
+    title = "Образовательные программы бакалавриата Astana IT University"
+    blocks = [f"## {title}\n\nВ Astana IT University {len(programs)} программ бакалавриата:\n\n{listing}"]
+    blocks += [f"## {meta['program_name']} ({meta['program_code']})\n\n{meta['school']}. {_overview(md)}".rstrip()
+               for meta, md in sorted(programs, key=lambda item: item[0]["program_name"])]
+    return build_document(title, [(SITE + "/ru/bachelor", blocks)], set(), updated_at)
+
+
 def fetch_pages(paths: list[str], raw_dir: Path, client: httpx.Client, delay: float = 1.0) -> dict[str, str]:
     """Fetch allowed paths into raw_dir (cached by path) and return {path: html}."""
     robots = RobotFileParser()
@@ -249,6 +271,9 @@ def main():
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(build_document(title, doc_pages, chrome, today), encoding="utf-8")
         print(f"{target}: {out.stat().st_size} bytes")
+    programs = {Path(t).name: (args.out / t).read_text(encoding="utf-8")
+                for t in SOURCES if t.startswith("programs/") and (args.out / t).exists()}
+    (args.out / "programs/index.md").write_text(build_program_catalog(programs, today), encoding="utf-8")
 
 
 if __name__ == "__main__":

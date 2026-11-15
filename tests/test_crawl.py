@@ -4,7 +4,7 @@ from pathlib import Path
 
 import httpx
 
-from backend.app.ingest.crawl import build_document, fetch_pages, html_to_blocks, site_chrome
+from backend.app.ingest.crawl import build_program_catalog, build_document, fetch_pages, html_to_blocks, site_chrome
 from backend.app.ingest.extract import _infer_section_type, build_markdown_chunks
 
 PAGE = """<html><head><script>var x = 1;</script></head><body>
@@ -135,6 +135,23 @@ class FetchPagesTests(unittest.TestCase):
             with httpx.Client(transport=httpx.MockTransport(handler), base_url="https://site") as client:
                 pages = fetch_pages(["/ru/gone", "/ru/a"], Path(tmp), client, delay=0)
         self.assertEqual(list(pages), ["/ru/a"])
+
+
+class ProgramCatalogTests(unittest.TestCase):
+    def test_lists_programs_by_school_with_short_description(self):
+        docs = {
+            "software_engineering.md": "---\ntitle: SE\n---\n## О специальности\n\nПрограмма учит разработке ПО. "
+                                       "Студенты осваивают несколько языков. Третье предложение.\n\n## Цель\n\nX",
+            "cs.md": "## О специальности\n\nЗащита информации.",
+        }
+        md = build_program_catalog(docs, "2026-11-16")
+        self.assertIn("## Образовательные программы бакалавриата Astana IT University", md)
+        self.assertIn("Software Engineering (6B06102)", md)
+        self.assertIn("Cybersecurity (6B06301)", md)
+        self.assertIn("Программа учит разработке ПО. Студенты осваивают несколько языков.", md)
+        self.assertNotIn("Третье предложение", md)
+        self.assertNotIn("AI Business", md)
+        self.assertTrue(md.startswith("---\ntitle:"))
 
 
 if __name__ == "__main__":

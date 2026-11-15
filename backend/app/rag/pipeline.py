@@ -3,7 +3,7 @@ from collections import defaultdict
 from time import perf_counter
 from backend.app.rag.retriever import retrieve_candidates, rank_candidates
 from backend.app.rag.planner import program_queries
-from backend.app.rag.structured import balanced_results, prefer_sections
+from backend.app.rag.structured import balanced_results, prefer_sections, wants_catalog
 
 
 def search(query, *, corpus, encode, fanout=True, candidates=8,
@@ -26,6 +26,13 @@ def search(query, *, corpus, encode, fanout=True, candidates=8,
         groups.append(results)
         for key, value in {**batch.timings, **ranking}.items():
             stages[key] += value
+    if not program_code and len(queries) == 1 and wants_catalog(query):
+        catalog = retrieve_candidates(query, k=50, mode="hybrid", corpus=corpus.rows, bm25=corpus.bm25,
+                                      encode_query=encode, dense_search=corpus.dense_search,
+                                      doc_types=("catalog",), language=language)
+        # The full list (first chunk) always leads; the best-matching programme description follows.
+        best = sorted(catalog.candidates, key=lambda row: row.get("chunk_index") != 0)[:2]
+        groups[0] = (*best, *groups[0])
     results = balanced_results(groups)
     stages["total_ms"] = (perf_counter() - start) * 1000
     return results, dict(stages), queries

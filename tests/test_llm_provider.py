@@ -21,6 +21,23 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         provider = await self.make(handler)
         self.assertEqual(await provider.complete_json([]), {"sufficient": False})
 
+    async def test_temperature_is_omitted_for_models_without_it(self):
+        sent = []
+
+        def handler(request):
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]})
+        provider = ChatCompletionsProvider(ChatSettings("https://test.invalid/v1", "k", "main", "fast", temperature=None),
+                                           transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(provider.close)
+        await provider.complete_json([])
+        self.assertNotIn("temperature", sent[0])
+
+    def test_temperature_from_env(self):
+        base = {"LLM_PROVIDER": "compatible", "LLM_BASE_URL": "https://x/v1", "LLM_API_KEY": "k", "LLM_MAIN_MODEL": "m"}
+        self.assertEqual(ChatSettings.from_env(base).temperature, 0.0)
+        self.assertIsNone(ChatSettings.from_env({**base, "LLM_TEMPERATURE": ""}).temperature)
+
     async def test_stream_success(self):
         body = 'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n\n'
         body += 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'

@@ -27,23 +27,25 @@ class ChatSettings:
     main_model: str
     fast_model: str
     timeout: float = 30.0
+    temperature: float | None = 0.0  # None: reasoning models accept only their default
 
     @classmethod
-    def from_env(cls):
-        provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    def from_env(cls, env=os.environ):
+        provider = env.get("LLM_PROVIDER", "groq").lower()
         if provider == "groq":
             base = "https://api.groq.com/openai/v1"
-            key = os.getenv("GROQ_API_KEY", "")
+            key = env.get("GROQ_API_KEY", "")
         elif provider == "compatible":
-            base = os.getenv("LLM_BASE_URL", "")
-            key = os.getenv("LLM_API_KEY", "")
+            base = env.get("LLM_BASE_URL", "")
+            key = env.get("LLM_API_KEY", "")
         else:
             raise ValueError("LLM_PROVIDER must be groq or compatible")
-        main = os.getenv("LLM_MAIN_MODEL") or os.getenv("LLM_MODEL", "")
-        fast = os.getenv("LLM_FAST_MODEL") or main
+        main = env.get("LLM_MAIN_MODEL") or env.get("LLM_MODEL", "")
+        fast = env.get("LLM_FAST_MODEL") or main
         if not base or not key or not main:
             raise ValueError("Configure the LLM endpoint, API key and model before startup")
-        return cls(base.rstrip("/"), key, main, fast)
+        temperature = env.get("LLM_TEMPERATURE", "0")
+        return cls(base.rstrip("/"), key, main, fast, temperature=float(temperature) if temperature else None)
 
 
 class ChatCompletionsProvider:
@@ -56,6 +58,11 @@ class ChatCompletionsProvider:
             transport=transport, follow_redirects=False,
         )
 
+    @property
+    def _sampling(self):
+        t = self.settings.temperature
+        return {} if t is None else {"temperature": t}
+
     @staticmethod
     def _check(response):
         if response.is_error:
@@ -65,8 +72,8 @@ class ChatCompletionsProvider:
         try:
             response = await self.client.post("chat/completions", json={
                 "model": self.settings.fast_model, "messages": messages,
-                "temperature": 0, "max_completion_tokens": 512,
-                "response_format": {"type": "json_object"}, "stream": False,
+                "max_completion_tokens": 4096,  # reasoning models spend this budget on thinking too
+                "response_format": {"type": "json_object"}, "stream": False, **self._sampling,
             })
             self._check(response)
             choice = response.json()["choices"][0]
@@ -86,7 +93,7 @@ class ChatCompletionsProvider:
         try:
             async with self.client.stream("POST", "chat/completions", json={
                 "model": self.settings.main_model, "messages": messages,
-                "temperature": 0, "max_completion_tokens": 1536, "stream": True,
+                "max_completion_tokens": 4096, "stream": True, **self._sampling,
             }) as response:
                 self._check(response)
                 data_lines = []

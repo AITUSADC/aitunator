@@ -40,3 +40,27 @@ class SectionSelectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CatalogQueryTests(unittest.TestCase):
+    def search(self, query):
+        from types import SimpleNamespace
+        from backend.app.rag.pipeline import search
+        payloads = [{"source": f"data/md/x{i}.md", "doc_type": "handbook", "text": f"шум {i}", "section": "s"} for i in range(6)]
+        payloads.append({"source": "data/md/programs/index.md#se", "doc_type": "catalog", "text": "SE", "section": "SE", "chunk_index": 1})
+        payloads.append({"source": "data/md/programs/index.md", "doc_type": "catalog", "text": "16 программ", "section": "list", "chunk_index": 0})
+        rows = [{"id": str(i), "payload": p} for i, p in enumerate(payloads)]
+
+        def dense_search(vector, scope, k):  # catalog is the least similar chunk, as in the real corpus
+            allowed = [r for r in rows if not scope.get("doc_types") or r["payload"]["doc_type"] in scope["doc_types"]]
+            return [{**r, "score": 1 - i / 10} for i, r in enumerate(allowed)][:k]
+        corpus = SimpleNamespace(rows=rows, bm25=None, dense_search=dense_search)
+        results, _, _ = search(query, corpus=corpus, encode=lambda _: [1.0])
+        return [r["source"] for r in results]
+
+    def test_program_list_questions_put_catalog_first(self):
+        for query in ("Какие программы есть в айту?", "Какие специальности есть в AITU?", "На кого можно учиться?"):
+            self.assertEqual(self.search(query)[0], "data/md/programs/index.md", query)
+
+    def test_other_questions_keep_retrieval_order(self):
+        self.assertNotIn("data/md/programs/index.md", self.search("Сколько стоит общежитие?"))
